@@ -195,9 +195,9 @@ class EncoderLayer(nn.Module):
 		# 注意力层->前馈神经网络层，每层前都对输入加层归一化LN，且输出都加上输入
 		norm_x = self.attention_norm(x)
 		# 自注意力
-		attn = x + self.attention(norm_x)
+		attn = x + self.attention.forward(norm_x, norm_x, norm_x)
 		norm_attn = self.fnn_norm(attn)
-		out = attn + self.feed_forward(norm_attn)
+		out = attn + self.feed_forward.forward(norm_attn)
 		return out
 
 class Encoder(nn.Module):
@@ -214,4 +214,198 @@ class Encoder(nn.Module):
 ```
 Encoder的输出就是对输入编码的结果
 ### Decoder
+Decoder同样由N个Decoder Layer组成，但是Decoder Layer由两个注意力层和一个前馈神经网络组成，第一个注意力层是**掩码自注意力层**，保证每个token只能使用该token之前的注意力分数，第二个注意力层是一个多头注意力层，该层使用第一个注意力层的输出作为query，使用Encoder的输出作为key和value，来计算注意力分数。最后再经过前馈神经网络
+```python
+class DecoderLayer(nn.Module):
+	def __init__(self, args):
+		super().__init__()
+		self.attention_norm_1 = LayerNorm(args.n_embd)
+		# 第一层掩码自注意力层
+		self.mask_attention = MultiHeadAttention(args, is_casual=True)
+		# 第二层自注意力层
+		self.attention_norm_2 = LayerNorm(args.n_embd)
+		self.attention = MultiHeadAttention(args, is_casual=False)
+		# 前馈神经网络层
+		self.ffn_norm = LayerNorm(args.n_embd)
+		self.ffn = MLP(args.dim, args.dim, args.dropout) 
+	def forward(self, x, enc_out):
+		# 残差 + 掩码注意力
+		norm_x = self.attention_norm_1(x)
+		mask_attn = x + self.mask_attention.forward(norm_x, norm_x, norm_x)
+		# 残差 + 自注意力
+		norm_mattn = self.attention_norm_2(mask_attn)
+		attn = mask_attn + self.attention.forward(norm_mattn, norm_mattn, norm_mattn)
+		# 残差 + 前馈神经网络
+		norm_attn = self.ffn_norm(attn)
+		out = attn + self.ffn.forward(norm_attn)
+		return out
+		
+class Decoder(nn.Module):
+	def __init__(self, args):
+		super(Decoder, self).__init__()
+		self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layer)])
+		self.norm = LayerNorm(args.n_embd)
+	def forward(self, x, enc_out):
+		for layer in self.layers:
+			x = layer.forward(x)
+		return self.norm(x)
+```
+## 组装Transformer
+### Embedding层
+负责将自然语言输入转为机器可处理的向量，实际是一个存储大小为vacab_size的词典的嵌入向量查找表。自然语言->分词器tokenizer切分为token->token对应固定index。
 
+Embedding 层的输入往往是一个形状为 （batch_size，seq_len，1）的矩阵，第一个维度是一次批处理的数量，第二个维度是自然语言序列的长度，第三个维度则是 token 经过 tokenizer 转化成的 index 值。
+
+实际就是一个可训练的(Vocab_size, embedding_dim)的矩阵，直接使用torch中的Embeddding层
+```python
+self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+```
+### 位置编码
+上述的注意力机制可以良好的并行，但会导致序列中相对位置的丢失，在RNN、LSTM中，输入序列会沿着语句本身的顺序被依次递归处理。
+位置编码，即根据序列中 token 的相对位置对其进行编码，再将位置编码加入词向量编码中。位置编码的方式有很多，Transformer 使用了正余弦函数来进行位置编码（绝对位置编码Sinusoidal），其编码方式为：
+$$
+PE(pos, 2i) = sin(\frac{pos}{10000^{\frac{2i}{d_{model}}}})\\
+PE(pos, 2i + 1) = cos(\frac{pos}{10000^{\frac{2i}{d_{model}}}})
+$$
+pos 为 token 在句子中的位置，2i 和 2i+1 则是指示了 token 是奇数位置还是偶数位置，从上式中我们可以看出对于奇数位置的 token 和偶数位置的 token，Transformer 采用了不同的函数进行编码。
+
+代码实现：
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+def PositionEncoding(seq_len, d_model, n=10000):
+	P = np.zeros((seq_len, d_model))
+	for k in range(seq_len):
+		for i in np.arange(int(d_model/2)):
+			denominator = np.power(n, 2*i/d_model)
+			P[k, 2*i] = np.sin(k/denominator)
+			P[k, 2*i+1] = np.cos(k/denominator)
+	return P
+
+P = PositionEncoding(seq_len=4, d_model=4, n=100)
+print(P)
+```
+这样的位置编码有两个好处：
+- 能够适应比训练集里面所有句子更长的句子，假设训练集里面最长的句子是有 20 个单词，突然来了一个长度为 21 的句子，则使用公式计算的方法可以计算出第 21 位的 Embedding。
+- 可以让模型容易地计算出相对位置，对于固定长度的间距 k，PE(pos+k) 可以用 PE(pos) 计算得到。因为 Sin(A+B) = Sin(A)Cos(B) + Cos(A)Sin(B), Cos(A+B) = Cos(A)Cos(B) - Sin(A)Sin(B)。
+
+基于上述原理，我们实现一个位置编码层
+```python
+class PositionalEncoding(nn.Module):
+	def __init__(self, args):
+		super(PositionalEncoding, self).__init__()
+
+		# block size 是序列最大长度
+		pe = torch.zeros(args.block_size, args.n_embd)
+		position = torch.arange(0, args.block_size).unsqueeze(1)
+
+		div_term = torch.exp(
+			torch.arange(0, args.n_embd, 2) * -(math.log(10000.0) / args.n_embd)
+		)
+		# 分别计算sin, cos的结果
+		pe[:, 0::2] = torch.sin(position * div_term)
+		pe[:, 1::2] = torch.cos(position * div_term)
+		pe = pe.unsqueeze(0)
+		self.register_buffer("pe", pe)
+	
+	def forward(self, x):
+		x = x + self.pe[:, : x.size(1)].requires_grad_(False)
+		return x
+```
+### 完整拼装
+基于之前的实现
+```python
+class Transformer(nn.Module):
+	def __init__(self, args):
+		super().__init__()
+		assert args.vocab_size is not None
+		assert args.block_size is not None
+		self.args = args
+		self.transformer = nn.ModuleDict(dict(
+			word_embedding=nn.Embedding(args.vocab_size, args.n_embd),
+			word_positional_encoding=PositionalEncoding(args),
+			drop = nn.Dropout(args.dropout),
+			encoder = Encoder(args),
+			decoder = Decoder(args),
+		))
+		self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+		self.apply(self._init_weights)
+		print("Transformer Parameters:", sum(p.numel() for p in self.parameters()))
+		print("Parameters number: %.2fM" % (self.get_num_params()/1e6))
+
+	# 统计参数量
+	def get_num_params(self, non_embedding=False):
+		n_params = sum(p.numel() for p in self.parameters())
+		if non_embedding:
+			n_params -= self.transformer.word_embedding.numel()
+		return n_params
+
+	# 初始化权重
+	def _init_weights(self, module):
+		# 线性层和Embedding层初始化为正态分布
+		if isinstance(module, nn.Linear):
+			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+			if module.bias is not None:
+				torch.nn.init.zeros_(module.bias)
+		elif isinstance(module, nn.Embedding):
+			torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+	def forward(self, idx, targets=None):
+		# idx: (batch_size, seq_len, 1)
+		# targets: (batch_size, seq_len, 1)
+		device = idx.device
+		b, t = idx.size()
+		assert t <= self.args.block_size, f"Cannot forward, too long sequence: {t} > {self.args.block_size}."
+
+		# 将idx通过Embedding层，得到维度(batch size, sequence length, n_embd)
+		print("idx", idx.size())
+		tok_emb = self.transformer.word_embedding(idx)
+		print("tok_emb", tok_emb.size())
+		# token embedding通过位置编码
+		tok_emb = self.transformer.word_positional_encoding(tok_emb)
+		print("tok_emb", tok_emb.size())
+		# 通过Dropout层
+		tok_emb = self.transformer.drop(tok_emb)
+		print("tok_emb", tok_emb.size())
+		# 通过Encoder
+		enc_out = self.transformer.encoder(tok_emb)
+		print("enc_out", enc_out.size())
+		# 通过Decoder
+		dec_out = self.transformer.decoder(tok_emb, enc_out)
+		print("dec_out", dec_out.size())
+		# 通过线性层，分为训练和推理
+		if targets is None:
+			# 推理时只需要logits, loss是None
+			logits = self.lm_head(dec_out)
+			print("logits", logits.size())
+			loss = None
+		else:
+			# 训练时，如果给了targets就计算loss
+			logits = self.lm_head(dec_out)
+			print("logits", logits.size()) # (batch size, sequence length, vocab size)
+			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+		return logits, loss
+```
+
+### 补充：交叉熵函数
+数学公式：
+$$
+H(p, q) = -\sum_{i=1}^{n} p_i \log q_i
+$$
+其中，p_i 是真实分布，q_i 是预测分布。
+```python
+def cross_entropy_with_logits(y_true, logits):
+    """
+    使用: CE = -sum(y_true * log_softmax(logits))
+    其中 log_softmax = logits - log(sum(exp(logits)))
+    """
+    # 数值稳定的log_softmax
+    max_vals = np.max(logits, axis=-1, keepdims=True)
+    stable_logits = logits - max_vals
+    log_softmax = stable_logits - np.log(np.sum(np.exp(stable_logits), axis=-1, keepdims=True))
+    
+    # 交叉熵
+    loss = -np.sum(y_true * log_softmax) / y_true.shape[0]
+    return loss
+```
