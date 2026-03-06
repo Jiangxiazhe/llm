@@ -1,2 +1,5 @@
 # 数据集
 data/
+__pycache__/
+base_model_215M/
+*.pyc
