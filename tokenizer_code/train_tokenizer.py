@@ -173,8 +173,8 @@ def eval_tokenizer(tokenizer_path: str) -> None:
 
 def main():
     # 配置路径
-    data_path = "./data/mobvoi_seq_monkey_general_open_corpus.jsonl"
-    save_dir = "tokenizer_k"
+    data_path = "../data/mobvoi_seq_monkey_general_open_corpus.jsonl"
+    save_dir = "../tokenizer_k"
 
     # 训练tokenizer
     train_tokenizer(

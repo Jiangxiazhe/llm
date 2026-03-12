@@ -203,7 +203,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tiny-LLM Pretraining")
     
     # 基础训练参数
-    parser.add_argument("--out_dir", type=str, default="base_model_215M", help="模型输出目录")
+    parser.add_argument("--out_dir", type=str, default="../base_model_215M", help="模型输出目录")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=16, help="批次大小")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     # 实验跟踪和数据加载参数
     parser.add_argument("--use_swanlab", action="store_true", help="是否使用SwanLab进行实验跟踪")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载的工作进程数")
-    parser.add_argument("--data_path", type=str, default="./data/seq_monkey_datawhale.jsonl", help="训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../data/seq_monkey_datawhale.jsonl", help="训练数据路径")
     
     # 训练优化参数
     parser.add_argument("--accumulation_steps", type=int, default=32, help="梯度累积步数")

@@ -3,3 +3,6 @@ data/
 __pycache__/
 base_model_215M/
 *.pyc
+sft_model_215M/
+model/
+swanlog
